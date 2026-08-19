@@ -324,6 +324,34 @@ function Step1({ form, set, errors, editMode }) {
           <Input value={form.google_maps_link} onChange={v => set("google_maps_link", v)} placeholder="https://maps.app.goo.gl/..." />
         </Field>
       </div>
+
+      <div style={{ border: `1px solid ${T.border}`, borderRadius: 10, padding: "16px 18px 0", marginBottom: 4, background: "#fbfcfd" }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.sec, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 4 }}>
+          Society Size & EV Penetration
+        </div>
+        <p style={{ fontSize: 12, color: T.ter, margin: "0 0 14px" }}>
+          Ask the RWA POC. Counts drive charger sizing and payback estimates.
+        </p>
+        <div style={{ display: "flex", gap: 14 }}>
+          <Field label="No. of Flats" required={!editMode} error={errors.flat_count} hint="Total units">
+            <Input type="number" value={form.flat_count} onChange={v => set("flat_count", v)}
+              placeholder="240" error={errors.flat_count} />
+          </Field>
+          <Field label="2W EVs" required={!editMode} error={errors.ev_2w_count} hint="Owned by residents">
+            <Input type="number" value={form.ev_2w_count} onChange={v => set("ev_2w_count", v)}
+              placeholder="18" error={errors.ev_2w_count} />
+          </Field>
+          <Field label="4W EVs" required={!editMode} error={errors.ev_4w_count} hint="Owned by residents">
+            <Input type="number" value={form.ev_4w_count} onChange={v => set("ev_4w_count", v)}
+              placeholder="6" error={errors.ev_4w_count} />
+          </Field>
+        </div>
+        {editMode && (
+          <p style={{ fontSize: 11.5, color: T.ter, margin: "0 0 16px" }}>
+            Leave blank if unknown — these will be backfilled from the bulk CSV.
+          </p>
+        )}
+      </div>
     </>
   );
 }
@@ -480,6 +508,9 @@ function StepReview({ form, editMode }) {
         ["Name", form.society_name], ["City", form.city], ["State", form.state],
         ["Address", form.address], ["Pincode", form.pincode],
         ["Maps", form.google_maps_link ? "✓ Provided" : ""],
+        ["Flats", form.flat_count],
+        ["EVs today", (form.flat_count || form.ev_2w_count || form.ev_4w_count)
+          ? `${form.ev_2w_count || 0} × 2W · ${form.ev_4w_count || 0} × 4W` : ""],
       ]} />
       <S title="Chargers" rows={[
         ...(parseInt(form.chargers_3_3kw) > 0 ? [["3.3 kW", `${form.chargers_3_3kw}× — CPO: ${form.cpo_3_3kw || "—"} — Fee: ₹${form.society_fee_3_3kw || 0}`]] : []),
@@ -508,12 +539,32 @@ function StepReview({ form, editMode }) {
 // ═══════════════════════════════════════════════════════════
 // VALIDATION
 // ═══════════════════════════════════════════════════════════
-function validateStep(step, form) {
+function validateStep(step, form, editMode) {
   const e = {};
+  // Whole numbers >= 0. Blank is only allowed when editing an existing society.
+  const checkCount = (key, min) => {
+    const raw = String(form[key] ?? "").trim();
+    if (raw === "") {
+      if (!editMode) e[key] = "Required";
+      return;
+    }
+    if (!/^\d+$/.test(raw)) { e[key] = "Whole number only"; return; }
+    if (parseInt(raw, 10) < min) e[key] = `Must be at least ${min}`;
+  };
+
   if (step === 0) {
     if (!(form.society_name || "").trim()) e.society_name = "Required";
     if (!form.city) e.city = "Required";
     if (!form.state) e.state = "Required";
+    checkCount("flat_count", 1);
+    checkCount("ev_2w_count", 0);
+    checkCount("ev_4w_count", 0);
+    // EVs can't outnumber flats by a wide margin — catches transposed entries
+    const flats = parseInt(form.flat_count, 10);
+    const ev2 = parseInt(form.ev_2w_count, 10);
+    const ev4 = parseInt(form.ev_4w_count, 10);
+    if (!e.flat_count && !e.ev_2w_count && flats > 0 && ev2 > flats * 4) e.ev_2w_count = "Looks too high vs flats";
+    if (!e.flat_count && !e.ev_4w_count && flats > 0 && ev4 > flats * 4) e.ev_4w_count = "Looks too high vs flats";
   } else if (step === 1) {
     if (!form.agreement_date) e.agreement_date = "Required";
     if (!form.electricity_rate || parseFloat(form.electricity_rate) <= 0) e.electricity_rate = "Enter a valid rate";
@@ -540,6 +591,7 @@ const STEPS = ["Society", "Tariff", "Bank", "Docs", "Contact", "Review"];
 
 const emptyForm = {
   society_name: "", city: "", state: "", address: "", pincode: "", google_maps_link: "",
+  flat_count: "", ev_2w_count: "", ev_4w_count: "",
   chargers_3_3kw: "0", cpo_3_3kw: "", society_fee_3_3kw: "0",
   chargers_7_4kw: "0", cpo_7_4kw: "", society_fee_7_4kw: "0",
   chargers_11kw: "0", cpo_11kw: "", society_fee_11kw: "0",
@@ -628,7 +680,7 @@ function OnboardingApp({ user }) {
   };
 
   const next = () => {
-    const errs = validateStep(step, form);
+    const errs = validateStep(step, form, mode === "edit");
     if (Object.keys(errs).length > 0) { setErrors(errs); return; }
     setErrors({});
     setStep(s => s + 1);
@@ -645,7 +697,14 @@ function OnboardingApp({ user }) {
       else delete payload.agreement_file;
       if (form.electricity_bill_file) payload.electricity_bill_file = form.electricity_bill_file.data;
       else delete payload.electricity_bill_file;
-      if (!payload.rwa_email) payload.rwa_email = (form.rwa_emails || "").split(",")[0].trim();
+      // Send the whole list, not just the first address. handleUpdate writes
+      // this value straight into the rwa_email column, so sending only
+      // .split(",")[0] silently truncated every society that has more than one
+      // dashboard login the next time anyone edited it.
+      if (!payload.rwa_email) {
+        payload.rwa_email = (form.rwa_emails || "")
+          .split(",").map(s => s.trim()).filter(Boolean).join(", ");
+      }
 
       await apiPost(payload);
 
